@@ -70,6 +70,25 @@ declare -a REPOSITORIES=(
     "2:myworkspace/devops-scripts:bitbucket-devops"
 )
 
+# Mirror URL for each repository — positionally aligned with REPOSITORIES.
+# After every clone/pull the script adds a "mirror" remote and runs
+# "git push --mirror" to replicate all branches, tags, and other refs.
+# Use "" to skip mirroring for a particular repository.
+#
+# Any Git remote URL is accepted: SSH, HTTPS, or a local path.
+# Mirrors stored on a second Git hosting service use the same SSH key
+# routing as primary remotes — just reference the host alias when needed.
+#
+# WARNING: git push --mirror overwrites the mirror remote completely.
+# It deletes any branch or tag on the mirror that no longer exists locally.
+declare -a REPO_MIRRORS=(
+    "git@mirror.example.com:backup/hello-world.git"
+    "git@mirror.example.com:backup/github-backend.git"
+    ""
+    "git@mirror.example.com:backup/gitlab-models.git"
+    "git@mirror.example.com:backup/bitbucket-devops.git"
+)
+
 # Root directory for all clones
 CLONE_BASE_DIR="${CLONE_BASE_DIR:-${HOME}/git-repos}"
 
@@ -130,6 +149,12 @@ validate_config() {
 SSH_KEY_FILES=$nk PASSPHRASE_ENV_VARS=$np — all must be equal."
     fi
 
+    local nr=${#REPOSITORIES[@]}
+    local nm=${#REPO_MIRRORS[@]}
+    if (( nr != nm )); then
+        die "Array length mismatch: REPOSITORIES=$nr REPO_MIRRORS=$nm — must be equal."
+    fi
+
     local missing=0
     for i in "${!SSH_KEY_FILES[@]}"; do
         if [[ ! -f "${SSH_KEY_FILES[$i]}" ]]; then
@@ -139,7 +164,7 @@ SSH_KEY_FILES=$nk PASSPHRASE_ENV_VARS=$np — all must be equal."
     done
     (( missing > 0 )) && warn "$missing key file(s) missing — those hosts will fail."
 
-    ok "Config OK — $nh host(s), ${#REPOSITORIES[@]} repository entry(s)"
+    ok "Config OK — $nh host(s), $nr repository entry(s)"
 }
 
 
@@ -330,12 +355,47 @@ test_connections() {
 
 
 # ============================================================
+# Push a complete mirror of a local clone to a mirror remote.
+#
+# "git push --mirror" replicates every ref (all branches, tags,
+# notes, etc.) and removes refs on the mirror that no longer exist
+# locally — making it an exact structural copy of the source.
+# ============================================================
+mirror_one() {
+    local target="$1"     # local repo path
+    local mirror_url="$2" # remote URL to mirror to
+    local label="$3"      # display label
+
+    # Configure the "mirror" remote: add on first run, update URL if changed.
+    local current_url
+    current_url=$(git -C "$target" remote get-url mirror 2>/dev/null || true)
+
+    if [[ -z "$current_url" ]]; then
+        git -C "$target" remote add mirror "$mirror_url"
+        log "$label  Mirror remote added: $mirror_url"
+    elif [[ "$current_url" != "$mirror_url" ]]; then
+        git -C "$target" remote set-url mirror "$mirror_url"
+        log "$label  Mirror remote URL updated: $mirror_url"
+    fi
+
+    log "$label  Pushing mirror → $mirror_url"
+    if git -C "$target" push --mirror mirror 2>&1 | sed "s/^/  $label /"; then
+        ok "$label  Mirror push complete"
+    else
+        warn "$label  Mirror push failed — check credentials and remote URL"
+        return 1
+    fi
+}
+
+
+# ============================================================
 # Clone or pull a single repository (runs as a background job)
 # ============================================================
 sync_one() {
     local host_idx="$1"
     local repo_path="$2"
     local local_dir="$3"
+    local mirror_url="${4:-}"   # optional mirror URL
 
     local alias="${GIT_HOSTS[$host_idx]}-idx${host_idx}"
     local remote_url="${GIT_USERS[$host_idx]}@${alias}:${repo_path}.git"
@@ -360,6 +420,11 @@ sync_one() {
             return 1
         fi
     fi
+
+    # Mirror after every successful clone/pull
+    if [[ -n "$mirror_url" ]]; then
+        mirror_one "$target" "$mirror_url" "$label"
+    fi
 }
 
 
@@ -376,9 +441,10 @@ sync_all() {
     local pids=()
     local labels=()
 
-    for entry in "${REPOSITORIES[@]}"; do
-        IFS=':' read -r host_idx repo_path local_dir <<< "$entry"
-        sync_one "$host_idx" "$repo_path" "$local_dir" &
+    for i in "${!REPOSITORIES[@]}"; do
+        IFS=':' read -r host_idx repo_path local_dir <<< "${REPOSITORIES[$i]}"
+        local mirror_url="${REPO_MIRRORS[$i]:-}"
+        sync_one "$host_idx" "$repo_path" "$local_dir" "$mirror_url" &
         pids+=($!)
         labels+=("$local_dir")
     done
@@ -415,12 +481,15 @@ list_config() {
     done
 
     banner "Configured repositories"
-    printf '  %-6s %-35s %s\n' 'HOST' 'REMOTE PATH' 'LOCAL DIR'
-    printf '  %s\n' "$(printf '─%.0s' {1..65})"
-    for entry in "${REPOSITORIES[@]}"; do
-        IFS=':' read -r host_idx repo_path local_dir <<< "$entry"
-        printf '  %-6s %-35s %s/%s\n' \
-            "${GIT_HOSTS[$host_idx]}" "$repo_path" "$CLONE_BASE_DIR" "$local_dir"
+    printf '  %-6s %-30s %-22s %s\n' 'HOST' 'REMOTE PATH' 'LOCAL DIR' 'MIRROR'
+    printf '  %s\n' "$(printf '─%.0s' {1..90})"
+    for i in "${!REPOSITORIES[@]}"; do
+        IFS=':' read -r host_idx repo_path local_dir <<< "${REPOSITORIES[$i]}"
+        local mirror_url="${REPO_MIRRORS[$i]:-}"
+        printf '  %-6s %-30s %-22s %s\n' \
+            "${GIT_HOSTS[$host_idx]}" "$repo_path" \
+            "${CLONE_BASE_DIR##*/}/$local_dir" \
+            "${mirror_url:-(none)}"
     done
 
     banner "Passphrase sources"
